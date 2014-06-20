@@ -1,6 +1,7 @@
 package eventsource
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -24,6 +25,8 @@ type Stream struct {
 	Errors chan error
 }
 
+var StreamPropagateHeaders = []string{"Cache-Control", "Accept", "Last-Event-Id"}
+
 // Subscribe to the Events emitted from the specified url.
 // If lastEventId is non-empty it will be sent to the server in case it can replay missed events.
 func Subscribe(url, lastEventId string) (*Stream, error) {
@@ -33,6 +36,7 @@ func Subscribe(url, lastEventId string) (*Stream, error) {
 		retry:       (time.Millisecond * 3000),
 		Events:      make(chan Event),
 		Errors:      make(chan error),
+		c:           http.Client{CheckRedirect: clientCheckRedirect},
 	}
 	r, err := stream.connect()
 	if err != nil {
@@ -40,6 +44,21 @@ func Subscribe(url, lastEventId string) (*Stream, error) {
 	}
 	go stream.stream(r)
 	return stream, nil
+}
+
+func clientCheckRedirect(req *http.Request, via []*http.Request) error {
+	// Default redirect check limit.
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	// Propagate event stream headers.
+	last := via[len(via)-1]
+	for _, header := range StreamPropagateHeaders {
+		if _, ok := last.Header[header]; ok {
+			req.Header.Set(header, last.Header.Get(header))
+		}
+	}
+	return nil
 }
 
 func (stream *Stream) connect() (r io.ReadCloser, err error) {
