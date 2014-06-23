@@ -12,10 +12,12 @@ import (
 // It will try and reconnect if the connection is lost, respecting both
 // received retry delays and event id's.
 type Stream struct {
-	c           http.Client
-	url         string
-	lastEventId string
-	retry       time.Duration
+	c              http.Client
+	rc             io.ReadCloser
+  closed         bool
+	url            string
+	lastEventId    string
+	retry          time.Duration
 	// Events emits the events received by the stream
 	Events chan Event
 	// Errors emits any errors encountered while reading events from the stream.
@@ -31,18 +33,17 @@ var StreamPropagateHeaders = []string{"Cache-Control", "Accept", "Last-Event-Id"
 // If lastEventId is non-empty it will be sent to the server in case it can replay missed events.
 func Subscribe(url, lastEventId string) (*Stream, error) {
 	stream := &Stream{
+		c:           http.Client{CheckRedirect: clientCheckRedirect},
 		url:         url,
 		lastEventId: lastEventId,
 		retry:       (time.Millisecond * 3000),
 		Events:      make(chan Event),
 		Errors:      make(chan error),
-		c:           http.Client{CheckRedirect: clientCheckRedirect},
 	}
-	r, err := stream.connect()
-	if err != nil {
+	if err := stream.connect(); err != nil {
 		return nil, err
 	}
-	go stream.stream(r)
+	go stream.stream()
 	return stream, nil
 }
 
@@ -61,7 +62,14 @@ func clientCheckRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-func (stream *Stream) connect() (r io.ReadCloser, err error) {
+func (stream *Stream) Close() {
+	stream.closed = true
+	if stream.rc != nil {
+		stream.rc.Close()
+	}
+}
+
+func (stream *Stream) connect() (err error) {
 	var resp *http.Response
 	var req *http.Request
 	if req, err = http.NewRequest("GET", stream.url, nil); err != nil {
@@ -75,19 +83,21 @@ func (stream *Stream) connect() (r io.ReadCloser, err error) {
 	if resp, err = stream.c.Do(req); err != nil {
 		return
 	}
-	r = resp.Body
+	stream.rc = resp.Body
 	return
 }
 
-func (stream *Stream) stream(r io.ReadCloser) {
-	defer r.Close()
-	dec := newDecoder(r)
+func (stream *Stream) stream() {
+	defer stream.rc.Close()
+	dec := newDecoder(stream.rc)
 	for {
 		ev, err := dec.Decode()
-
 		if err != nil {
-			stream.Errors <- err
+			if stream.closed {
+				return
+			}
 			// respond to all errors by reconnecting and trying again
+			stream.Errors <- err
 			break
 		}
 		pub := ev.(*publication)
@@ -107,9 +117,9 @@ func (stream *Stream) stream(r io.ReadCloser) {
 		// NOTE: because of the defer we're opening the new connection
 		// before closing the old one. Shouldn't be a problem in practice,
 		// but something to be aware of.
-		next, err := stream.connect()
-		if err == nil {
-			go stream.stream(next)
+	  err := stream.connect()
+    if err == nil {
+			go stream.stream()
 			break
 		}
 		stream.Errors <- err
