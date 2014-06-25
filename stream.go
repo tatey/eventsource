@@ -2,103 +2,117 @@ package eventsource
 
 import (
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"time"
 )
 
-// Stream handles a connection for receiving Server Sent Events.
-// It will try and reconnect if the connection is lost, respecting both
-// received retry delays and event id's.
-type Stream struct {
-	c              http.Client
-	rc             io.ReadCloser
-  closed         bool
-	url            string
-	lastEventId    string
-	retry          time.Duration
-	// Events emits the events received by the stream
-	Events chan Event
-	// Errors emits any errors encountered while reading events from the stream.
-	// It's mainly for informative purposes - the client isn't required to take any
-	// action when an error is encountered. The stream will always attempt to continue,
-	// even if that involves reconnecting to the server.
-	Errors chan error
+func clientRequestHeaders(request *http.Request, lastEventId string) {
+	request.Header.Set("Cache-Control", "no-cache")
+	request.Header.Set("Accept", "text/event-stream")
+	if len(lastEventId) > 0 {
+		request.Header.Set("Last-Event-ID", lastEventId)
+	}
 }
 
-var StreamPropagateHeaders = []string{"Cache-Control", "Accept", "Last-Event-Id"}
-
-// Subscribe to the Events emitted from the specified url.
-// If lastEventId is non-empty it will be sent to the server in case it can replay missed events.
-func Subscribe(url, lastEventId string) (*Stream, error) {
-	stream := &Stream{
-		c:           http.Client{CheckRedirect: clientCheckRedirect},
-		url:         url,
-		lastEventId: lastEventId,
-		retry:       (time.Millisecond * 3000),
-		Events:      make(chan Event),
-		Errors:      make(chan error),
+func clientCheckRedirect(request *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
 	}
-	if err := stream.connect(); err != nil {
+	clientRequestHeaders(request, via[len(via)-1].Header.Get("Last-Event-Id")) // Go normalized key.
+	return nil
+}
+
+func clientCheckReconnect(stream *Stream, err error) error {
+	// Default emit error but reconnect.
+	stream.Errors <- err
+	return nil
+}
+
+type Client struct {
+	*http.Client
+	// Check if the stream should reconnect or not. You may want to handle stream.Response.StatusCode == 401.
+	CheckReconnect func(*Stream, error) error
+	// Default user defined reconnect timeout. Streams may also issue a retry.
+	Retry time.Duration
+}
+
+func NewClient() *Client {
+	return &Client{
+		Client:         &http.Client{CheckRedirect: clientCheckRedirect},
+		CheckReconnect: clientCheckReconnect,
+		Retry:          (time.Second * 3),
+	}
+}
+
+// DefaultClient is the default Client used by Subscribe.
+var DefaultClient = NewClient()
+
+type Stream struct {
+	Client      *Client
+	Request     *http.Request
+	Response    *http.Response
+	lastEventId string
+	Events      chan Event
+	Errors      chan error
+	retry       time.Duration
+}
+
+func (client Client) Subscribe(url, lastEventId string) (*Stream, error) {
+	request, err := http.NewRequest("GET", url, nil)
+	if err != nil {
 		return nil, err
+	}
+	clientRequestHeaders(request, lastEventId)
+
+	stream := &Stream{
+		Client:  &client,
+		Request: request,
+		retry:   client.Retry,
+		Events:  make(chan Event),
+		Errors:  make(chan error),
 	}
 	go stream.stream()
 	return stream, nil
 }
 
-func clientCheckRedirect(req *http.Request, via []*http.Request) error {
-	// Default redirect check limit.
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
-	}
-	// Propagate event stream headers.
-	last := via[len(via)-1]
-	for _, header := range StreamPropagateHeaders {
-		if _, ok := last.Header[header]; ok {
-			req.Header.Set(header, last.Header.Get(header))
-		}
-	}
-	return nil
+func Subscribe(url, lastEventId string) (*Stream, error) {
+	return DefaultClient.Subscribe(url, lastEventId)
 }
 
 func (stream *Stream) Close() {
-	stream.closed = true
-	if stream.rc != nil {
-		stream.rc.Close()
+	if stream.Response != nil {
+		stream.Response.Body.Close()
 	}
-}
-
-func (stream *Stream) connect() (err error) {
-	var resp *http.Response
-	var req *http.Request
-	if req, err = http.NewRequest("GET", stream.url, nil); err != nil {
-		return
-	}
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Accept", "text/event-stream")
-	if len(stream.lastEventId) > 0 {
-		req.Header.Set("Last-Event-ID", stream.lastEventId)
-	}
-	if resp, err = stream.c.Do(req); err != nil {
-		return
-	}
-	stream.rc = resp.Body
-	return
 }
 
 func (stream *Stream) stream() {
-	defer stream.rc.Close()
-	dec := newDecoder(stream.rc)
+	defer stream.Close()
+	var err error
+
+connect:
+	for attempts := 0; ; attempts++ {
+		stream.Response, err = stream.Client.Do(stream.Request)
+		if err != nil || stream.Response.StatusCode != 200 {
+			if err = clientCheckReconnect(stream, err); err != nil {
+				return
+			}
+			// Log backoff.
+			log.Printf("Reconnecting in %0.4fs", (stream.retry ^ time.Duration(attempts)).Seconds())
+			time.Sleep(stream.retry ^ time.Duration(attempts))
+		} else {
+			goto streaming
+		}
+	}
+streaming:
+	dec := newDecoder(stream.Response.Body)
 	for {
 		ev, err := dec.Decode()
 		if err != nil {
-			if stream.closed {
+			if err = clientCheckReconnect(stream, err); err != nil {
 				return
 			}
-			// respond to all errors by reconnecting and trying again
-			stream.Errors <- err
-			break
+			goto connect
 		}
 		pub := ev.(*publication)
 		if pub.Retry() > 0 {
@@ -108,21 +122,5 @@ func (stream *Stream) stream() {
 			stream.lastEventId = pub.Id()
 		}
 		stream.Events <- ev
-	}
-	backoff := stream.retry
-	for {
-		time.Sleep(backoff)
-		log.Printf("Reconnecting in %0.4f secs", backoff.Seconds())
-
-		// NOTE: because of the defer we're opening the new connection
-		// before closing the old one. Shouldn't be a problem in practice,
-		// but something to be aware of.
-	  err := stream.connect()
-    if err == nil {
-			go stream.stream()
-			break
-		}
-		stream.Errors <- err
-		backoff *= 2
 	}
 }
