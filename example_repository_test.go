@@ -6,6 +6,8 @@ import (
 	"github.com/donovanhide/eventsource"
 	"net"
 	"net/http"
+	"sync"
+	"time"
 )
 
 type NewsArticle struct {
@@ -33,6 +35,8 @@ func buildRepo(srv *eventsource.Server) {
 }
 
 func ExampleRepository() {
+	var wg sync.WaitGroup
+
 	srv := eventsource.NewServer()
 	defer srv.Close()
 	http.HandleFunc("/articles", srv.Handler("articles"))
@@ -42,26 +46,43 @@ func ExampleRepository() {
 	}
 	defer l.Close()
 	go http.Serve(l, nil)
+
+	// This will receive events in the order that they come
 	stream, err := eventsource.Subscribe("http://127.0.0.1:8080/articles", "")
 	if err != nil {
 		return
 	}
-	go buildRepo(srv)
-	// This will receive events in the order that they come
-	for i := 0; i < 3; i++ {
-		ev := <-stream.Events
-		fmt.Println(ev.Id(), ev.Event(), ev.Data())
-	}
+	// Give Subscribe a chance to connect.
+	// Might be nice to add a connection state we can wait on.
+	time.Sleep(time.Second)
+
+	wg.Add(3)
+	go func() {
+		for i := 0; i < 3; i++ {
+			ev := <-stream.Events
+			fmt.Println(ev.Id(), ev.Event(), ev.Data())
+			wg.Done()
+		}
+	}()
+	buildRepo(srv)
+	wg.Wait()
+
+	// This will replay the events in order of id
 	stream, err = eventsource.Subscribe("http://127.0.0.1:8080/articles", "1")
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	// This will replay the events in order of id
-	for i := 0; i < 3; i++ {
-		ev := <-stream.Events
-		fmt.Println(ev.Id(), ev.Event(), ev.Data())
-	}
+	wg.Add(3)
+	go func() {
+		for i := 0; i < 3; i++ {
+			ev := <-stream.Events
+			fmt.Println(ev.Id(), ev.Event(), ev.Data())
+			wg.Done()
+		}
+	}()
+	wg.Wait()
+
 	// Output:
 	// 2 News Article {"Title":"Governments struggle to control global price of gas","Content":"Hot air...."}
 	// 1 News Article {"Title":"Tomorrow is another day","Content":"And so is the day after."}
