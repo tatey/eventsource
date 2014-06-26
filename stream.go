@@ -25,7 +25,9 @@ func clientCheckRedirect(request *http.Request, via []*http.Request) error {
 
 func clientCheckReconnect(stream *Stream, err error) error {
 	// Default emit error but reconnect.
-	stream.Errors <- err
+	if err != nil {
+		stream.Errors <- err
+	}
 	return nil
 }
 
@@ -94,7 +96,7 @@ connect:
 	for attempts := 0; ; attempts++ {
 		stream.Response, err = stream.Client.Do(stream.Request)
 		if err != nil || stream.Response.StatusCode != 200 {
-			if err = clientCheckReconnect(stream, err); err != nil {
+			if err = stream.Client.CheckReconnect(stream, err); err != nil {
 				return
 			}
 			// Log backoff.
@@ -109,7 +111,7 @@ streaming:
 	for {
 		ev, err := dec.Decode()
 		if err != nil {
-			if err = clientCheckReconnect(stream, err); err != nil {
+			if err = stream.Client.CheckReconnect(stream, err); err != nil {
 				return
 			}
 			goto connect

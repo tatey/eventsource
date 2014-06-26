@@ -4,6 +4,7 @@ import (
 	"github.com/donovanhide/eventsource"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -33,12 +34,16 @@ func TestStreamReconnect(t *testing.T) {
 	}))
 	defer ts.Close()
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	client := eventsource.NewClient()
 	client.CheckReconnect = func(stream *eventsource.Stream, err error) error {
+		wg.Done()
 		if stream.Response.StatusCode != 401 {
 			t.Errorf("CheckReconnect called on response StatusCode 200")
 		}
 		return err
 	}
 	client.Subscribe(ts.URL, "")
+	wg.Wait()
 }
