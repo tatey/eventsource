@@ -50,6 +50,15 @@ func NewClient() *Client {
 // DefaultClient is the default Client used by Subscribe.
 var DefaultClient = NewClient()
 
+type StreamState uint8
+
+const (
+	_ StreamState = iota
+	StreamConnecting
+	StreamOpen
+	StreamClosed
+)
+
 type Stream struct {
 	Client      *Client
 	Request     *http.Request
@@ -57,6 +66,7 @@ type Stream struct {
 	lastEventId string
 	Events      chan Event
 	Errors      chan error
+	state       StreamState
 	retry       time.Duration
 }
 
@@ -83,37 +93,50 @@ func Subscribe(url, lastEventId string) (*Stream, error) {
 }
 
 func (stream *Stream) Close() {
+	stream.state = StreamClosed
 	if stream.Response != nil {
 		stream.Response.Body.Close()
 	}
 }
 
+// TODO: Can be golfed quite a bit still.
 func (stream *Stream) stream() {
 	defer stream.Close()
 	var err error
 
 connect:
-	for attempts := 0; ; attempts++ {
+	stream.state = StreamConnecting
+	for backoff := stream.retry; ; backoff *= 2 {
 		stream.Response, err = stream.Client.Do(stream.Request)
+		if stream.state == StreamClosed {
+			return
+		}
 		if err != nil || stream.Response.StatusCode != 200 {
 			if err = stream.Client.CheckReconnect(stream, err); err != nil {
 				return
 			}
 			// Log backoff.
-			log.Printf("Reconnecting in %0.4fs", (stream.retry ^ time.Duration(attempts)).Seconds())
-			time.Sleep(stream.retry ^ time.Duration(attempts))
+			log.Printf("Reconnecting to %s in %s", stream.Request.URL, backoff)
+			time.Sleep(backoff)
 		} else {
-			goto streaming
+			goto open
 		}
 	}
-streaming:
+open:
+	stream.state = StreamOpen
 	dec := newDecoder(stream.Response.Body)
 	for {
 		ev, err := dec.Decode()
+		if stream.state == StreamClosed {
+			return
+		}
 		if err != nil {
 			if err = stream.Client.CheckReconnect(stream, err); err != nil {
 				return
 			}
+			// Log backoff.
+			log.Printf("Reconnecting to %s in %s", stream.Request.URL, stream.retry)
+			time.Sleep(stream.retry)
 			goto connect
 		}
 		pub := ev.(*publication)
