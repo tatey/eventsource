@@ -2,7 +2,7 @@ package eventsource
 
 import (
 	"errors"
-	"log"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -115,8 +115,7 @@ connect:
 			if err = stream.Client.CheckReconnect(stream, err); err != nil {
 				return
 			}
-			// Log backoff.
-			log.Printf("Reconnecting to %s in %s", stream.Request.URL, backoff)
+			stream.Errors <- fmt.Errorf("Reconnecting to %s in %s", stream.Request.URL, backoff)
 			time.Sleep(backoff)
 		} else {
 			goto open
@@ -134,8 +133,7 @@ open:
 			if err = stream.Client.CheckReconnect(stream, err); err != nil {
 				return
 			}
-			// Log backoff.
-			log.Printf("Reconnecting to %s in %s", stream.Request.URL, stream.retry)
+			stream.Errors <- fmt.Errorf("Reconnecting to %s in %s", stream.Request.URL, stream.retry)
 			time.Sleep(stream.retry)
 			goto connect
 		}
